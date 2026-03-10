@@ -18,7 +18,7 @@ Function Log-Error {
 # --- Actively wait for OneNote to finish downloading lazy-loaded content ---
 Function Wait-For-Page-Load {
     param( $onenote, $pageID, $pageName )
-    $timeoutSeconds = 120 # 2 minutes maximum
+    $timeoutSeconds = 10 # 10 seconds maximum
     $startTime = Get-Date
     
     Write-Host "      -> [Navigation] Triggering download engine..." -ForegroundColor Cyan
