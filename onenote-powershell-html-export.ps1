@@ -4,6 +4,7 @@
 # [http://thebackend.info/powershell/2017/12/onenote-read-and-write-content-with-powershell/](http://thebackend.info/powershell/2017/12/onenote-read-and-write-content-with-powershell/)
 # [https://stackoverflow.com/questions/53639041/how-to-access-contents-of-onenote-page](https://stackoverflow.com/questions/53639041/how-to-access-contents-of-onenote-page)
 
+
 # --- Error Logging Helper ---
 Function Log-Error {
     param( [string]$message )
@@ -12,6 +13,7 @@ Function Log-Error {
     # Write to the script-scoped log file immediately
     Out-File -FilePath $script:errorLogPath -InputObject $logLine -Append -Encoding UTF8
 }
+
 
 # --- Actively wait for OneNote to finish downloading lazy-loaded content ---
 Function Wait-For-Page-Load {
@@ -48,17 +50,14 @@ Function Wait-For-Page-Load {
         $hasTextPlaceholder = ($xml -match "Wait for OneNote") -or ($xml -match "Wait for onenote")
         
         $xmlDoc = [xml]$xml
-        
-        # 2. Explicitly check for OneNote's "CallbackID" tag, which it uses when data is pending download
-        $hasCallback = $null -ne ($xmlDoc | Select-Xml -XPath "//*[one:CallbackID]" -Namespace $schema)
-
-        # 3. Parse XML to find empty image nodes. We explicitly IGNORE background images 
+    
+        # 2. Parse XML to find empty image nodes. We explicitly IGNORE background images 
         # (not(@backgroundImage='true')) because the API omits their data even when fully loaded.
         $pendingImages = $xmlDoc | Select-Xml -XPath "//one:Image[not(one:Data) and not(@pathCache) and not(@backgroundImage='true')]" -Namespace $schema
         $pendingFiles = $xmlDoc | Select-Xml -XPath "//one:InsertedFile[not(@pathCache)]" -Namespace $schema
         
         # If no placeholders and no pending nodes are found, the page is fully loaded!
-        if (-not $hasTextPlaceholder -and -not $hasCallback -and ($null -eq $pendingImages) -and ($null -eq $pendingFiles)) {
+        if (-not $hasTextPlaceholder -and ($null -eq $pendingImages) -and ($null -eq $pendingFiles)) {
             Start-Sleep -Milliseconds 300 # Brief pause to let the OneNote rendering engine catch up
             if ($isWaiting) { Write-Host "" } # End the inline line gracefully
             Write-Host "      -> [Success] Page fully loaded!" -ForegroundColor Green
@@ -88,6 +87,7 @@ Function Wait-For-Page-Load {
     return $false
 }
 
+
 # --- Dynamically recreate OneNote rule/grid lines in HTML via CSS ---
 Function Inject-HTML-Background {
     param ( $xml, $htmlFilePath, $pageName )
@@ -95,6 +95,13 @@ Function Inject-HTML-Background {
         $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
         $xmlDoc = [xml]$xml
         $ruleLines = $xmlDoc | Select-Xml -XPath "//one:RuleLines" -Namespace $schema
+        
+        # We always want to inject the CSS to make ink transparent, even if there is no grid!
+        # The CSS target is images that are wrapped in a DIV (which is how OneNote exports ink strokes)
+        $baseCss = "
+        <style> 
+            div > img { mix-blend-mode: multiply; } 
+        "
         
         if ($ruleLines -and $ruleLines.Node.visible -eq "true") {
             $isGrid = $null -ne ($ruleLines.Node | Select-Xml -XPath "one:Vertical" -Namespace $schema)
@@ -108,21 +115,28 @@ Function Inject-HTML-Background {
             $lineColor = "#d1e1e8" 
             
             if ($isGrid) {
-                Write-Host "      -> [UI] Injecting CSS Grid Lines (${spacingPx}px)" -ForegroundColor Cyan
-                $css = "<style> body { background-color: white !important; background-size: ${spacingPx}px ${spacingPx}px !important; background-image: linear-gradient(to right, $lineColor 1px, transparent 1px), linear-gradient(to bottom, $lineColor 1px, transparent 1px) !important; } </style>"
+                Write-Host "      -> [UI] Injecting CSS Grid Lines (${spacingPx}px) & Ink Transparency" -ForegroundColor Cyan
+                $baseCss += "body { background-color: white !important; background-size: ${spacingPx}px ${spacingPx}px !important; background-image: linear-gradient(to right, $lineColor 1px, transparent 1px), linear-gradient(to bottom, $lineColor 1px, transparent 1px) !important; }"
             } else {
-                Write-Host "      -> [UI] Injecting CSS Lined Paper (${spacingPx}px)" -ForegroundColor Cyan
-                $css = "<style> body { background-color: white !important; background-size: 100% ${spacingPx}px !important; background-image: linear-gradient(transparent $([math]::Max(1, $spacingPx - 1))px, $lineColor 1px) !important; } </style>"
+                Write-Host "      -> [UI] Injecting CSS Lined Paper (${spacingPx}px) & Ink Transparency" -ForegroundColor Cyan
+                $baseCss += "body { background-color: white !important; background-size: 100% ${spacingPx}px !important; background-image: linear-gradient(transparent $([math]::Max(1, $spacingPx - 1))px, $lineColor 1px) !important; }"
             }
-            
-            $htmlContent = Get-Content -Path $htmlFilePath -Raw
-            $htmlContent = $htmlContent -replace "(?i)</head>", "`n$css`n</head>"
-            Set-Content -Path $htmlFilePath -Value $htmlContent -Encoding UTF8
+        } else {
+            Write-Host "      -> [UI] Injecting CSS Ink Transparency" -ForegroundColor Cyan
         }
+        
+        # Close the style tag
+        $baseCss += "</style>"
+
+        $htmlContent = Get-Content -Path $htmlFilePath -Raw
+        $htmlContent = $htmlContent -replace "(?i)</head>", "`n$baseCss`n</head>"
+        Set-Content -Path $htmlFilePath -Value $htmlContent -Encoding UTF8
+
     } catch {
-        Log-Error "Failed to inject CSS rule lines for page '$pageName'. Error: $_"
+        Log-Error "Failed to inject CSS rule lines/transparency for page '$pageName'. Error: $_"
     }
 }
+
 
 # --- Export page ---
 Function Export-OneNote-Page {
@@ -132,6 +146,7 @@ Function Export-OneNote-Page {
     Write-Host "    Page: $($file)"
     
     Wait-For-Page-Load -onenote $onenote -pageID $node.ID -pageName $name | Out-Null
+
 
     try {
         # 1. Export standard HTML
@@ -150,11 +165,13 @@ Function Export-OneNote-Page {
     }
     
     # 4. Export Attachments using already-fetched XML
-	$attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
+    $attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
     Export-OneNote-Attachments -xml $xml -path $attachmentpath -pageName $name
+
 
     return $file
 }
+
 
 # --- Copy embedded attachments (Updated to use passed XML) ---
 Function Export-OneNote-Attachments {
@@ -175,6 +192,7 @@ Function Export-OneNote-Attachments {
     }
 }
 
+
 Function Spider-OneNote-Notebook {
     param( $onenote, $node, $path, $notebookRoot )
     $tocHtml = ""
@@ -183,11 +201,13 @@ Function Spider-OneNote-Notebook {
     $grandparent = ""
     $parent = ""
 
+
     foreach($child in $node.ChildNodes) {
         try {
             $safeName = ReplaceIllegal -text $child.name
             $levelchange = $child.pageLevel - $previouslevel
             $displayName = [System.Net.WebUtility]::HtmlEncode($child.name)
+
 
             if (-not $child.HasChildNodes) {
                 # --- It's a Page ---
@@ -233,12 +253,14 @@ Function Spider-OneNote-Notebook {
                 New-Item -Path $folder -ItemType directory -ErrorAction Ignore | Out-Null
                 Write-Host "  Section: $($folder)"
 
+
                 $tocHtml += "<li class='section'>$displayName<ul>`n"
                 # Recursively crawl the section and append its HTML
                 $childToc = Spider-OneNote-Notebook -onenote $onenote -node $child -path $folder -notebookRoot $notebookRoot
                 $tocHtml += $childToc
                 $tocHtml += "</ul></li>`n"
             }
+
 
             # Store page level & name for next loop iteration
             $previouslevel = $child.pageLevel
@@ -251,12 +273,14 @@ Function Spider-OneNote-Notebook {
     return $tocHtml
 }
 
+
 Function ReplaceIllegal {
     param ( $text )
     $illegal = [string]::join('',([System.IO.Path]::GetInvalidFileNameChars())) -replace '\\','\\'
     $replaced = $text -replace "[$illegal]",'_'
     return $replaced
 }
+
 
 Function Get-Folder($initialDirectory) {
     [System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms")|Out-Null
@@ -267,21 +291,27 @@ Function Get-Folder($initialDirectory) {
     return $folder
 }
 
+
 # ================= MAIN EXECUTION =================
+
 
 # Get export folder
 $folder = Get-Folder
+
 
 if (-not $folder) {
     Write-Host "No folder selected. Exiting."
     exit
 }
 
+
 # Define the global error log path at the root of the selected export directory
 $script:errorLogPath = Join-Path -Path $folder -ChildPath "errors.log"
 
+
 # Initialize the log file
 Out-File -FilePath $script:errorLogPath -InputObject "=== OneNote Export Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" -Encoding UTF8
+
 
 try {
     # Connect to OneNote COM API
@@ -293,6 +323,7 @@ try {
     Log-Error "Failed to initialize OneNote COM Object or GetHierarchy. Error: $_"
     exit
 }
+
 
 # Loop over each notebook
 foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
@@ -306,6 +337,7 @@ foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
         
         # Kick off the spidering and capture the generated HTML list
         $tocBody = Spider-OneNote-Notebook -onenote $OneNote -node $notebook -path $nf -notebookRoot $nf
+
 
         # Wrap the list in a clean, styled HTML document
         $safeNotebookName = [System.Net.WebUtility]::HtmlEncode($notebook.name)
@@ -338,6 +370,7 @@ foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
 </html>
 "@
 
+
         $indexPath = Join-Path -Path $nf -ChildPath "index.htm"
         Set-Content -Path $indexPath -Value $indexHtml -Encoding UTF8
         Write-Host "  -> Created Table of Contents: $($indexPath)"
@@ -347,10 +380,13 @@ foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
     }
 }
 
+
 # Cleanup filelist.xml files
 Get-ChildItem -path $folder filelist.xml -Recurse | foreach { Remove-Item -Path $_.FullName -ErrorAction Ignore }
 
+
 $finishTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 Out-File -FilePath $script:errorLogPath -InputObject "=== OneNote Export Finished: $finishTime ===" -Append -Encoding UTF8
+
 
 Write-Host "`nExport Complete! Check '$script:errorLogPath' for any errors that occurred." -ForegroundColor Cyan
