@@ -47,13 +47,18 @@ Function Wait-For-Page-Load {
         # 1. Check if the literal placeholder text exists anywhere on the page
         $hasTextPlaceholder = ($xml -match "Wait for OneNote") -or ($xml -match "Wait for onenote")
         
-        # 2. Parse the XML to find empty image/file nodes
         $xmlDoc = [xml]$xml
-        $pendingImages = $xmlDoc | Select-Xml -XPath "//one:Image[not(one:Data) and not(@pathCache)]" -Namespace $schema
+        
+        # 2. Explicitly check for OneNote's "CallbackID" tag, which it uses when data is pending download
+        $hasCallback = $null -ne ($xmlDoc | Select-Xml -XPath "//*[one:CallbackID]" -Namespace $schema)
+
+        # 3. Parse XML to find empty image nodes. We explicitly IGNORE background images 
+        # (not(@backgroundImage='true')) because the API omits their data even when fully loaded.
+        $pendingImages = $xmlDoc | Select-Xml -XPath "//one:Image[not(one:Data) and not(@pathCache) and not(@backgroundImage='true')]" -Namespace $schema
         $pendingFiles = $xmlDoc | Select-Xml -XPath "//one:InsertedFile[not(@pathCache)]" -Namespace $schema
         
         # If no placeholders and no pending nodes are found, the page is fully loaded!
-        if (-not $hasTextPlaceholder -and ($null -eq $pendingImages) -and ($null -eq $pendingFiles)) {
+        if (-not $hasTextPlaceholder -and -not $hasCallback -and ($null -eq $pendingImages) -and ($null -eq $pendingFiles)) {
             Start-Sleep -Milliseconds 300 # Brief pause to let the OneNote rendering engine catch up
             if ($isWaiting) { Write-Host "" } # End the inline line gracefully
             Write-Host "      -> [Success] Page fully loaded!" -ForegroundColor Green
@@ -77,7 +82,7 @@ Function Wait-For-Page-Load {
     if ($isWaiting) { Write-Host "" } # End inline line on timeout
     
     # Timeout reached
-    $errMsg = "TIMEOUT ERROR: Page '$pageName' (ID: $pageID) failed to download all images/files within the 2-minute limit."
+    $errMsg = "TIMEOUT ERROR: Page '$pageName' (ID: $pageID) failed to download all assets within the $timeoutSeconds second limit."
     Write-Host "      -> [ERROR] $errMsg" -ForegroundColor Red
     Log-Error $errMsg
     return $false
