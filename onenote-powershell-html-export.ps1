@@ -230,8 +230,8 @@ Function Export-OneNote-Page {
     # 5. Export Attachments using already-fetched XML
     Export-OneNote-Attachments -xml $xml -path $attachmentpath -pageName $name
 
-    # Return both the HTML path and the potential Ink Title URL
-    return @{ FilePath = $file; InkTitleUrl = $inkTitleUrl }
+    # Return both the HTML path and the potential Ink Title URL as a strict object
+    return [PSCustomObject]@{ FilePath = $file; InkTitleUrl = $inkTitleUrl }
 }
 
 
