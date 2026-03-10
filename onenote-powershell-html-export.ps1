@@ -56,8 +56,15 @@ Function Wait-For-Page-Load {
         $pendingImages = $xmlDoc | Select-Xml -XPath "//one:Image[not(one:Data) and not(@pathCache) and not(@backgroundImage='true')]" -Namespace $schema
         $pendingFiles = $xmlDoc | Select-Xml -XPath "//one:InsertedFile[not(@pathCache)]" -Namespace $schema
         
-        # If no placeholders and no pending nodes are found, the page is fully loaded!
-        if (-not $hasTextPlaceholder -and ($null -eq $pendingImages) -and ($null -eq $pendingFiles)) {
+        # 3. FAST-FAIL CHECK: If there are background images, but ZERO foreground images/files 
+        # anywhere on the page, there is nothing left to wait for.
+        $hasBackgroundImages = $null -ne ($xmlDoc | Select-Xml -XPath "//one:Image[@backgroundImage='true']" -Namespace $schema)
+        $hasAnyForegroundMedia = $null -ne ($xmlDoc | Select-Xml -XPath "//one:Image[not(@backgroundImage='true')] | //one:InsertedFile" -Namespace $schema)
+        
+        $onlyBackgroundsExist = ($hasBackgroundImages -and -not $hasAnyForegroundMedia)
+
+        # If no placeholders and no pending nodes are found (or it's a background-only page), it's fully loaded!
+        if (-not $hasTextPlaceholder -and ($onlyBackgroundsExist -or (($null -eq $pendingImages) -and ($null -eq $pendingFiles)))) {
             Start-Sleep -Milliseconds 300 # Brief pause to let the OneNote rendering engine catch up
             if ($isWaiting) { Write-Host "" } # End the inline line gracefully
             Write-Host "      -> [Success] Page fully loaded!" -ForegroundColor Green
