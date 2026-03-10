@@ -95,6 +95,55 @@ Function Wait-For-Page-Load {
 }
 
 
+# --- Extract handwritten ink titles as PNG images ---
+Function Extract-Ink-Title {
+    param ( $onenote, $xml, $pageID, $htmlFilePath, $attachmentsPath, $pageName )
+    try {
+        $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
+        $xmlDoc = [xml]$xml
+        
+        $inkTitleNode = $xmlDoc | Select-Xml -XPath "//one:Page/one:Title//one:InkWord" -Namespace $schema
+        
+        if ($inkTitleNode -and $inkTitleNode.Node.CallbackID) {
+            Write-Host "      -> [Ink] Handwritten title detected. Extracting..." -ForegroundColor Cyan
+            
+            $callbackID = $inkTitleNode.Node.CallbackID
+            $base64String = ""
+            
+            $onenote.GetBinaryPageContent($pageID, $callbackID, [ref]$base64String)
+            
+            if ($base64String) {
+                if (-not (Test-Path $attachmentsPath)) {
+                    New-Item -Path $attachmentsPath -ItemType Directory -ErrorAction Ignore | Out-Null
+                }
+                
+                $imageBytes = [Convert]::FromBase64String($base64String)
+                $imageFileName = "InkTitle_$($pageID -replace '\{|\}|-','').png"
+                $imagePath = Join-Path -Path $attachmentsPath -ChildPath $imageFileName
+                [System.IO.File]::WriteAllBytes($imagePath, $imageBytes)
+                
+                $folderName = Split-Path $attachmentsPath -Leaf
+                $relativeImgUrl = "$folderName/$imageFileName"
+                
+                $htmlContent = Get-Content -Path $htmlFilePath -Raw
+                $imgTag = "<div style='padding: 20px 0px;'><img src='$relativeImgUrl' style='max-height: 80px; mix-blend-mode: multiply;' alt='Handwritten Title' /></div>"
+                
+                $htmlContent = $htmlContent -replace "(?i)(<body[^>]*>)", "`$1`n$imgTag"
+                Set-Content -Path $htmlFilePath -Value $htmlContent -Encoding UTF8
+                
+                Write-Host "      -> [Ink] Title image saved: $imageFileName" -ForegroundColor Green
+                
+                # RETURN the relative URL so the Spider function can use it for the TOC
+                return $relativeImgUrl
+            }
+        }
+    } catch {
+        Log-Error "Failed to extract Ink Title for page '$pageName'. Error: $_"
+    }
+    return $null
+}
+
+
 # --- Dynamically recreate OneNote rule/grid lines in HTML via CSS ---
 Function Inject-HTML-Background {
     param ( $xml, $htmlFilePath, $pageName )
@@ -171,12 +220,18 @@ Function Export-OneNote-Page {
         return $null
     }
     
-    # 4. Export Attachments using already-fetched XML
+    # 4. Check for and extract handwritten ink titles
     $attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
+    $inkTitleUrl = $null
+    if ($name -match "Untitled Page" -or $name -match "Unbenannte Seite") {
+        $inkTitleUrl = Extract-Ink-Title -onenote $onenote -xml $xml -pageID $node.ID -htmlFilePath $file -attachmentsPath $attachmentpath -pageName $name
+    }
+    
+    # 5. Export Attachments using already-fetched XML
     Export-OneNote-Attachments -xml $xml -path $attachmentpath -pageName $name
 
-
-    return $file
+    # Return both the HTML path and the potential Ink Title URL
+    return @{ FilePath = $file; InkTitleUrl = $inkTitleUrl }
 }
 
 
@@ -261,13 +316,34 @@ Function Spider-OneNote-Notebook {
                 Write-Host "  Section: $($folder)"
 
 
-                $tocHtml += "<li class='section'>$displayName<ul>`n"
+                # Create a relative link for the index.htm
+                if ($fileAbsPath -and $fileAbsPath.FilePath) {
+                    $relPath = $fileAbsPath.FilePath.Substring($notebookRoot.Length + 1)
+                    $relUrl = $relPath -replace '\\', '/' -replace ' ', '%20'
+                    
+                    # Use margin-left to visually indent subpages based on their OneNote level
+                    $indentLevel = [int]$child.pageLevel * 20
+                    
+                    # If we got an Ink Title URL back, use it instead of the generic text!
+                    if ($fileAbsPath.InkTitleUrl) {
+                        # We need to prepend the relative folder path to the image URL so it works from the index.htm root
+                        $parentFolderPath = Split-Path $relUrl -Parent
+                        $fullImgUrl = if ($parentFolderPath) { "$parentFolderPath/$($fileAbsPath.InkTitleUrl)" } else { $fileAbsPath.InkTitleUrl }
+                        
+                        # Generate an inline image tag for the link text
+                        $linkContent = "<img src='$fullImgUrl' style='height: 24px; vertical-align: middle; mix-blend-mode: multiply;' alt='Ink Title' />"
+                    } else {
+                        $linkContent = $displayName
+                    }
+                    
+                    $tocHtml += "<li class='page' style='margin-left: $($indentLevel)px;'><a href=`"$relUrl`">$linkContent</a></li>`n"
+                }
+
                 # Recursively crawl the section and append its HTML
                 $childToc = Spider-OneNote-Notebook -onenote $onenote -node $child -path $folder -notebookRoot $notebookRoot
                 $tocHtml += $childToc
                 $tocHtml += "</ul></li>`n"
             }
-
 
             # Store page level & name for next loop iteration
             $previouslevel = $child.pageLevel
