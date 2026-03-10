@@ -1,10 +1,81 @@
 # References & sources used to create script:
-  # https://passbe.com/2019/08/01/bulk-export-onenote-2013-2016-pages-as-html/
-  # https://stackoverflow.com/questions/53689087/powershell-and-onenote
-  # http://thebackend.info/powershell/2017/12/onenote-read-and-write-content-with-powershell/
-  # https://stackoverflow.com/questions/53639041/how-to-access-contents-of-onenote-page
+# [https://passbe.com/2019/08/01/bulk-export-onenote-2013-2016-pages-as-html/](https://passbe.com/2019/08/01/bulk-export-onenote-2013-2016-pages-as-html/)
+# [https://stackoverflow.com/questions/53689087/powershell-and-onenote](https://stackoverflow.com/questions/53689087/powershell-and-onenote)
+# [http://thebackend.info/powershell/2017/12/onenote-read-and-write-content-with-powershell/](http://thebackend.info/powershell/2017/12/onenote-read-and-write-content-with-powershell/)
+# [https://stackoverflow.com/questions/53639041/how-to-access-contents-of-onenote-page](https://stackoverflow.com/questions/53639041/how-to-access-contents-of-onenote-page)
 
-# Get export folder
+# --- Error Logging Helper ---
+Function Log-Error {
+    param( [string]$message )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logLine = "[$timestamp] $message"
+    # Write to the script-scoped log file immediately
+    Out-File -FilePath $script:errorLogPath -InputObject $logLine -Append -Encoding UTF8
+}
+
+# --- Actively wait for OneNote to finish downloading lazy-loaded content ---
+Function Wait-For-Page-Load {
+    param( $onenote, $pageID, $pageName )
+    $timeoutSeconds = 600 # 10 minutes maximum
+    $startTime = Get-Date
+    
+    Write-Host "      -> [Navigation] Navigating to page to trigger download engine..." -ForegroundColor Cyan
+    Write-Host "      -> [WARNING] Do not click inside OneNote or interrupt navigation during this load!" -ForegroundColor Yellow
+    
+    try {
+        $onenote.NavigateTo($pageID)
+    } catch {
+        Log-Error "Failed to NavigateTo page '$pageName' (ID: $pageID). Error: $_"
+        return $false
+    }
+    
+    $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
+    $lastPrintedSecond = -1
+    
+    do {
+        $xml = ""
+        try {
+            # 0 = piAll (returns all page content, including binary data and cache paths)
+            $onenote.GetPageContent($pageID, [ref]$xml, 0)
+        } catch {
+            Log-Error "Failed to GetPageContent for page '$pageName' during wait loop. Error: $_"
+            return $false
+        }
+        
+        # 1. Check if the literal placeholder text exists anywhere on the page
+        $hasTextPlaceholder = ($xml -match "Wait for OneNote") -or ($xml -match "Wait for onenote")
+        
+        # 2. Parse the XML to find empty image/file nodes
+        $xmlDoc = [xml]$xml
+        $pendingImages = $xmlDoc | Select-Xml -XPath "//one:Image[not(one:Data) and not(@pathCache)]" -Namespace $schema
+        $pendingFiles = $xmlDoc | Select-Xml -XPath "//one:InsertedFile[not(@pathCache)]" -Namespace $schema
+        
+        # If no placeholders and no pending nodes are found, the page is fully loaded!
+        if (-not $hasTextPlaceholder -and ($null -eq $pendingImages) -and ($null -eq $pendingFiles)) {
+            Start-Sleep -Milliseconds 300 # Brief pause to let the OneNote rendering engine catch up
+            Write-Host "      -> [Success] Page fully loaded!" -ForegroundColor Green
+            return $true
+        }
+        
+        $elapsedSeconds = [math]::Floor(((Get-Date) - $startTime).TotalSeconds)
+        
+        # Print status update every 5 seconds to the console
+        if ($elapsedSeconds % 5 -eq 0 -and $elapsedSeconds -ne $lastPrintedSecond) {
+            Write-Host "      -> [Wait] Waiting for page '$pageName' to load... ($elapsedSeconds of $timeoutSeconds seconds elapsed)" -ForegroundColor DarkCyan
+            $lastPrintedSecond = $elapsedSeconds
+        }
+        
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $startTime.AddSeconds($timeoutSeconds))
+    
+    # Timeout reached
+    $errMsg = "TIMEOUT ERROR: Page '$pageName' (ID: $pageID) failed to download all images/files within the 10-minute limit."
+    Write-Host "      -> [ERROR] $errMsg" -ForegroundColor Red
+    Log-Error $errMsg
+    return $false
+}
+
+# --- Get export folder ---
 Function Get-Folder($initialDirectory) {
     [System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms")|Out-Null
     $foldername = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -17,7 +88,7 @@ Function Get-Folder($initialDirectory) {
     return $folder
 }
 
-# Spider and find each page, create directory for each group, and build TOC HTML
+# --- Spider and find each page, create directory for each group, and build TOC HTML ---
 Function Spider-OneNote-Notebook {
     param( $onenote, $node, $path, $notebookRoot )
     $tocHtml = ""
@@ -27,105 +98,124 @@ Function Spider-OneNote-Notebook {
     $parent = ""
 
     foreach($child in $node.ChildNodes) {
-        $safeName = ReplaceIllegal -text $child.name
-        $levelchange = $child.pageLevel - $previouslevel
-        $displayName = [System.Net.WebUtility]::HtmlEncode($child.name)
+        try {
+            $safeName = ReplaceIllegal -text $child.name
+            $levelchange = $child.pageLevel - $previouslevel
+            $displayName = [System.Net.WebUtility]::HtmlEncode($child.name)
 
-        if (-not $child.HasChildNodes) {
-            # --- It's a Page ---
-            if ($levelchange -eq 1) {
-                if ($previouslevel -ne 0) {
-                    $grandparent = $parent
-                    $parent = $previousname
+            if (-not $child.HasChildNodes) {
+                # --- It's a Page ---
+                if ($levelchange -eq 1) {
+                    if ($previouslevel -ne 0) {
+                        $grandparent = $parent
+                        $parent = $previousname
+                    }
+                    $filepath = Join-Path -path $(join-path -path $path -ChildPath $grandparent) -ChildPath $parent
+                    New-Item -Path $filepath -ItemType directory -ErrorAction Ignore | Out-Null
+                    $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $filepath
+                } elseif ($levelchange -eq -1) {
+                    $filepath = Join-Path -path $path -ChildPath $grandparent
+                    New-Item -Path $filepath -ItemType directory -ErrorAction Ignore | Out-Null
+                    $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $filepath
+                    $parent = $grandparent
+                    $grandparent = ""
+                } elseif ($levelchange -eq -2) {
+                    $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $path
+                    $parent = ""
+                    $grandparent = ""
+                } elseif ($levelchange -eq 0 -and $parent -eq "") {
+                    $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $path
+                } else {
+                    $grandparentpath = Join-Path -path $path -ChildPath $grandparent
+                    $filepath = Join-Path -path $grandparentpath -ChildPath $parent
+                    New-Item -Path $filepath -ItemType directory -ErrorAction Ignore | Out-Null
+                    $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $filepath
                 }
-                $filepath = Join-Path -path $(join-path -path $path -ChildPath $grandparent) -ChildPath $parent
-                New-Item -Path $filepath -ItemType directory -ErrorAction Ignore | Out-Null
-                $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $filepath
-            } elseif ($levelchange -eq -1) {
-                $filepath = Join-Path -path $path -ChildPath $grandparent
-                New-Item -Path $filepath -ItemType directory -ErrorAction Ignore | Out-Null
-                $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $filepath
-                $parent = $grandparent
-                $grandparent = ""
-            } elseif ($levelchange -eq -2) {
-                $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $path
-                $parent = ""
-                $grandparent = ""
-            } elseif ($levelchange -eq 0 -and $parent -eq "") {
-                $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $path
-            } else {
-                $grandparentpath = Join-Path -path $path -ChildPath $grandparent
-                $filepath = Join-Path -path $grandparentpath -ChildPath $parent
-                New-Item -Path $filepath -ItemType directory -ErrorAction Ignore | Out-Null
-                $fileAbsPath = Export-OneNote-Page -onenote $onenote -node $child -path $filepath
-            }
-            
-            # Create a relative link for the index.htm
-            if ($fileAbsPath) {
-                $relPath = $fileAbsPath.Substring($notebookRoot.Length + 1)
-                $relUrl = $relPath -replace '\\', '/' -replace ' ', '%20'
                 
-                # Use margin-left to visually indent subpages based on their OneNote level
-                $indentLevel = [int]$child.pageLevel * 20
-                $tocHtml += "<li class='page' style='margin-left: $($indentLevel)px;'><a href=`"$relUrl`">$displayName</a></li>`n"
+                # Create a relative link for the index.htm
+                if ($fileAbsPath) {
+                    $relPath = $fileAbsPath.Substring($notebookRoot.Length + 1)
+                    $relUrl = $relPath -replace '\\', '/' -replace ' ', '%20'
+                    
+                    # Use margin-left to visually indent subpages based on their OneNote level
+                    $indentLevel = [int]$child.pageLevel * 20
+                    $tocHtml += "<li class='page' style='margin-left: $($indentLevel)px;'><a href=`"$relUrl`">$displayName</a></li>`n"
+                }
+
+            } else {
+                # --- It's a Section or Section Group ---
+                $folder = Join-Path -Path $path -ChildPath $safeName
+                New-Item -Path $folder -ItemType directory -ErrorAction Ignore | Out-Null
+                Write-Host "  Section: $($folder)"
+
+                $tocHtml += "<li class='section'>$displayName<ul>`n"
+                # Recursively crawl the section and append its HTML
+                $childToc = Spider-OneNote-Notebook -onenote $onenote -node $child -path $folder -notebookRoot $notebookRoot
+                $tocHtml += $childToc
+                $tocHtml += "</ul></li>`n"
             }
 
-        } else {
-            # --- It's a Section or Section Group ---
-            $folder = Join-Path -Path $path -ChildPath $safeName
-            New-Item -Path $folder -ItemType directory -ErrorAction Ignore | Out-Null
-            Write-Host "  Section: $($folder)"
-
-            $tocHtml += "<li class='section'>$displayName<ul>`n"
-            # Recursively crawl the section and append its HTML
-            $childToc = Spider-OneNote-Notebook -onenote $onenote -node $child -path $folder -notebookRoot $notebookRoot
-            $tocHtml += $childToc
-            $tocHtml += "</ul></li>`n"
+            # Store page level & name for next loop iteration
+            $previouslevel = $child.pageLevel
+            $previousname = $safeName 
+        } catch {
+            $errName = if ($child.name) { $child.name } else { "Unknown Node" }
+            Log-Error "Failed while spidering node '$errName'. Error: $_"
         }
-
-        # Store page level & name for next loop iteration
-        $previouslevel = $child.pageLevel
-        $previousname = $safeName 
     }
     
     return $tocHtml
 }
 
-# Export page
+# --- Export page ---
 Function Export-OneNote-Page {
     param( $onenote, $node, $path )
-    # Replace invalid file characters
     $name = ReplaceIllegal -text $node.name
     $file = $(Join-Path -Path $path -ChildPath "$($name).htm")
     Write-Host "    Page: $($file)"
     
-    # Export
-    $onenote.Publish($node.ID, $file, 7, "")
-    
-    # [BUGFIX] Changed $child.Name to $name here so attachments export correctly
-	$attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
-    Export-OneNote-Attachments -onenote $onenote -node $node -path $attachmentpath
+    # Wait for the page to download its assets before exporting
+    Wait-For-Page-Load -onenote $onenote -pageID $node.ID -pageName $name | Out-Null
 
-    # Return the absolute path so the Spider function can link to it
+    try {
+        # Export HTML
+        $onenote.Publish($node.ID, $file, 7, "")
+    } catch {
+        Log-Error "COM API Publish() failed for page '$name'. Error: $_"
+        return $null
+    }
+    
+    # Export Attachments
+	$attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
+    Export-OneNote-Attachments -onenote $onenote -node $node -path $attachmentpath -pageName $name
+
     return $file
 }
 
-# Copy embedded attachments
+# --- Copy embedded attachments ---
 Function Export-OneNote-Attachments {
-    param ( $onenote, $node, $path )
-    $xml = ''
-    $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
-    $onenote.GetPageContent($node.ID, [ref]$xml)
-    $xml | Select-Xml -XPath "//one:Page/one:Outline/one:OEChildren/one:OE/one:InsertedFile" -Namespace $schema | foreach {
-        $file = Join-Path -Path $path -ChildPath $_.Node.preferredName
-        Write-Host "      Attachment: $($file)"
-        Copy-Item $_.Node.pathCache -Destination $file
+    param ( $onenote, $node, $path, $pageName )
+    try {
+        $xml = ''
+        $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
+        $onenote.GetPageContent($node.ID, [ref]$xml)
+        $xml | Select-Xml -XPath "//one:Page/one:Outline/one:OEChildren/one:OE/one:InsertedFile" -Namespace $schema | foreach {
+            $file = Join-Path -Path $path -ChildPath $_.Node.preferredName
+            Write-Host "      Attachment: $($file)"
+            try {
+                Copy-Item $_.Node.pathCache -Destination $file -ErrorAction Stop
+            } catch {
+                Log-Error "Failed to copy attachment '$($_.Node.preferredName)' for page '$pageName'. PathCache: '$($_.Node.pathCache)'. Error: $_"
+            }
+        }
+    } catch {
+        Log-Error "Failed to parse attachments XML for page '$pageName'. Error: $_"
     }
 }
 
 Function ReplaceIllegal {
     param ( $text )
-    $illegal = [string]::join('',([System.IO.Path]::GetInvalidFileNameChars())) -replace '\\\\','\\\\'
+    $illegal = [string]::join('',([System.IO.Path]::GetInvalidFileNameChars())) -replace '\\','\\'
     $replaced = $text -replace "[$illegal]",'_'
     return $replaced
 }
@@ -140,24 +230,39 @@ if (-not $folder) {
     exit
 }
 
-# Connect to OneNote COM API
-$OneNote = New-Object -ComObject OneNote.Application
-[xml]$Hierarchy = ""
-$OneNote.GetHierarchy("", [Microsoft.Office.InterOp.OneNote.HierarchyScope]::hsPages, [ref]$Hierarchy)
+# Define the global error log path at the root of the selected export directory
+$script:errorLogPath = Join-Path -Path $folder -ChildPath "errors.log"
+
+# Initialize the log file
+Out-File -FilePath $script:errorLogPath -InputObject "=== OneNote Export Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" -Encoding UTF8
+
+try {
+    # Connect to OneNote COM API
+    $OneNote = New-Object -ComObject OneNote.Application
+    [xml]$Hierarchy = ""
+    $OneNote.GetHierarchy("", [Microsoft.Office.InterOp.OneNote.HierarchyScope]::hsPages, [ref]$Hierarchy)
+} catch {
+    Write-Host "CRITICAL ERROR: Failed to connect to OneNote COM API. Make sure OneNote Desktop is installed and open." -ForegroundColor Red
+    Log-Error "Failed to initialize OneNote COM Object or GetHierarchy. Error: $_"
+    exit
+}
 
 # Loop over each notebook
 foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
-    $name = ReplaceIllegal -text $notebook.name
-    $nf = Join-Path -Path $folder -ChildPath $name
-    Write-Host "Notebook: $($nf)"
-    New-Item -Path $nf -ItemType directory -ErrorAction Ignore | Out-Null
-    
-    # Kick off the spidering and capture the generated HTML list
-    $tocBody = Spider-OneNote-Notebook -onenote $OneNote -node $notebook -path $nf -notebookRoot $nf
+    try {
+        $name = ReplaceIllegal -text $notebook.name
+        $nf = Join-Path -Path $folder -ChildPath $name
+        Write-Host "=======================================" -ForegroundColor Magenta
+        Write-Host "Notebook: $($nf)" -ForegroundColor Magenta
+        Write-Host "=======================================" -ForegroundColor Magenta
+        New-Item -Path $nf -ItemType directory -ErrorAction Ignore | Out-Null
+        
+        # Kick off the spidering and capture the generated HTML list
+        $tocBody = Spider-OneNote-Notebook -onenote $OneNote -node $notebook -path $nf -notebookRoot $nf
 
-    # Wrap the list in a clean, styled HTML document
-    $safeNotebookName = [System.Net.WebUtility]::HtmlEncode($notebook.name)
-    $indexHtml = @"
+        # Wrap the list in a clean, styled HTML document
+        $safeNotebookName = [System.Net.WebUtility]::HtmlEncode($notebook.name)
+        $indexHtml = @"
 <!DOCTYPE html>
 <html>
 <head>
@@ -186,12 +291,20 @@ foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
 </html>
 "@
 
-    # Save the index.htm at the root of the exported Notebook folder
-    $indexPath = Join-Path -Path $nf -ChildPath "index.htm"
-    Set-Content -Path $indexPath -Value $indexHtml -Encoding UTF8
-    Write-Host "  -> Created Table of Contents: $($indexPath)"
+        # Save the index.htm at the root of the exported Notebook folder
+        $indexPath = Join-Path -Path $nf -ChildPath "index.htm"
+        Set-Content -Path $indexPath -Value $indexHtml -Encoding UTF8
+        Write-Host "  -> Created Table of Contents: $($indexPath)"
+    } catch {
+        $nbName = if ($notebook.name) { $notebook.name } else { "Unknown" }
+        Log-Error "Critical error processing notebook '$nbName'. Error: $_"
+    }
 }
 
 # Cleanup filelist.xml files
-Get-ChildItem -path $folder filelist.xml -Recurse | foreach { Remove-Item -Path $_.FullName }
-Write-Host "Export Complete!"
+Get-ChildItem -path $folder filelist.xml -Recurse | foreach { Remove-Item -Path $_.FullName -ErrorAction Ignore }
+
+$finishTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+Out-File -FilePath $script:errorLogPath -InputObject "=== OneNote Export Finished: $finishTime ===" -Append -Encoding UTF8
+
+Write-Host "`nExport Complete! Check '$script:errorLogPath' for any errors that occurred." -ForegroundColor Cyan
