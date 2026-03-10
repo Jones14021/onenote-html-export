@@ -201,8 +201,8 @@ Function Export-OneNote-Page {
     $file = $(Join-Path -Path $path -ChildPath "$($name).htm")
     Write-Host "    Page: $($file)"
     
-    Wait-For-Page-Load -onenote $onenote -pageID $node.ID -pageName $name | Out-Null
-
+    # Cast to [void] to prevent the boolean return from bleeding into the pipeline
+    [void](Wait-For-Page-Load -onenote $onenote -pageID $node.ID -pageName $name)
 
     try {
         # 1. Export standard HTML
@@ -224,14 +224,19 @@ Function Export-OneNote-Page {
     $attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
     $inkTitleUrl = $null
     if ($name -match "Untitled Page" -or $name -match "Unbenannte Seite") {
+        # We explicitly assign the return to $inkTitleUrl, but we must ensure nothing else bleeds out
         $inkTitleUrl = Extract-Ink-Title -onenote $onenote -xml $xml -pageID $node.ID -htmlFilePath $file -attachmentsPath $attachmentpath -pageName $name
     }
     
     # 5. Export Attachments using already-fetched XML
     Export-OneNote-Attachments -xml $xml -path $attachmentpath -pageName $name
 
-    # Return both the HTML path and the potential Ink Title URL as a strict object
-    return [PSCustomObject]@{ FilePath = $file; InkTitleUrl = $inkTitleUrl }
+    # Safely construct and return the pure object
+    $outputObj = New-Object -TypeName psobject
+    $outputObj | Add-Member -MemberType NoteProperty -Name FilePath -Value $file
+    $outputObj | Add-Member -MemberType NoteProperty -Name InkTitleUrl -Value $inkTitleUrl
+
+    return $outputObj
 }
 
 
