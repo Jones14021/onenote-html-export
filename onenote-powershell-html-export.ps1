@@ -16,11 +16,11 @@ Function Log-Error {
 # --- Actively wait for OneNote to finish downloading lazy-loaded content ---
 Function Wait-For-Page-Load {
     param( $onenote, $pageID, $pageName )
-    $timeoutSeconds = 600 # 10 minutes maximum
+    $timeoutSeconds = 120 # 2 minutes maximum
     $startTime = Get-Date
     
-    Write-Host "      -> [Navigation] Navigating to page to trigger download engine..." -ForegroundColor Cyan
-    Write-Host "      -> [WARNING] Do not click inside OneNote or interrupt navigation during this load!" -ForegroundColor Yellow
+    Write-Host "      -> [Navigation] Triggering download engine..." -ForegroundColor Cyan
+    Write-Host "      -> [WARNING] Do not click inside OneNote during this load!" -ForegroundColor Yellow
     
     try {
         $onenote.NavigateTo($pageID)
@@ -31,6 +31,7 @@ Function Wait-For-Page-Load {
     
     $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
     $lastPrintedSecond = -1
+    $isWaiting = $false
     
     do {
         $xml = ""
@@ -38,6 +39,7 @@ Function Wait-For-Page-Load {
             # 0 = piAll (returns all page content, including binary data and cache paths)
             $onenote.GetPageContent($pageID, [ref]$xml, 0)
         } catch {
+            if ($isWaiting) { Write-Host "" } # Break the inline line on error
             Log-Error "Failed to GetPageContent for page '$pageName' during wait loop. Error: $_"
             return $false
         }
@@ -53,42 +55,121 @@ Function Wait-For-Page-Load {
         # If no placeholders and no pending nodes are found, the page is fully loaded!
         if (-not $hasTextPlaceholder -and ($null -eq $pendingImages) -and ($null -eq $pendingFiles)) {
             Start-Sleep -Milliseconds 300 # Brief pause to let the OneNote rendering engine catch up
+            if ($isWaiting) { Write-Host "" } # End the inline line gracefully
             Write-Host "      -> [Success] Page fully loaded!" -ForegroundColor Green
             return $true
         }
         
         $elapsedSeconds = [math]::Floor(((Get-Date) - $startTime).TotalSeconds)
         
-        # Print status update every 5 seconds to the console
-        if ($elapsedSeconds % 5 -eq 0 -and $elapsedSeconds -ne $lastPrintedSecond) {
-            Write-Host "      -> [Wait] Waiting for page '$pageName' to load... ($elapsedSeconds of $timeoutSeconds seconds elapsed)" -ForegroundColor DarkCyan
+        # Print status update inline using carriage return (`r) and NoNewline
+        if ($elapsedSeconds -ne $lastPrintedSecond) {
+            $msg = "      -> [Wait] Waiting for '$pageName' to load... ($elapsedSeconds of $timeoutSeconds seconds)"
+            # Pad with spaces to ensure it overwrites previous longer lines
+            Write-Host "`r$($msg.PadRight(90, ' '))" -NoNewline -ForegroundColor DarkCyan
             $lastPrintedSecond = $elapsedSeconds
+            $isWaiting = $true
         }
         
         Start-Sleep -Seconds 1
     } while ((Get-Date) -lt $startTime.AddSeconds($timeoutSeconds))
     
+    if ($isWaiting) { Write-Host "" } # End inline line on timeout
+    
     # Timeout reached
-    $errMsg = "TIMEOUT ERROR: Page '$pageName' (ID: $pageID) failed to download all images/files within the 10-minute limit."
+    $errMsg = "TIMEOUT ERROR: Page '$pageName' (ID: $pageID) failed to download all images/files within the 2-minute limit."
     Write-Host "      -> [ERROR] $errMsg" -ForegroundColor Red
     Log-Error $errMsg
     return $false
 }
 
-# --- Get export folder ---
-Function Get-Folder($initialDirectory) {
-    [System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms")|Out-Null
-    $foldername = New-Object System.Windows.Forms.FolderBrowserDialog
-    $foldername.Description = "Select an export folder"
-    $foldername.rootfolder = "MyComputer"
-    if($foldername.ShowDialog() -eq "OK")
-    {
-        $folder += $foldername.SelectedPath
+# --- Dynamically recreate OneNote rule/grid lines in HTML via CSS ---
+Function Inject-HTML-Background {
+    param ( $xml, $htmlFilePath, $pageName )
+    try {
+        $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
+        $xmlDoc = [xml]$xml
+        $ruleLines = $xmlDoc | Select-Xml -XPath "//one:RuleLines" -Namespace $schema
+        
+        if ($ruleLines -and $ruleLines.Node.visible -eq "true") {
+            $isGrid = $null -ne ($ruleLines.Node | Select-Xml -XPath "one:Vertical" -Namespace $schema)
+            $horizontal = $ruleLines.Node | Select-Xml -XPath "one:Horizontal" -Namespace $schema
+            
+            $spacingPts = 23.76 # OneNote default
+            if ($horizontal -and $horizontal.Node.spacing) {
+                $spacingPts = [double]$horizontal.Node.spacing
+            }
+            $spacingPx = [math]::Round($spacingPts * 1.33)
+            $lineColor = "#d1e1e8" 
+            
+            if ($isGrid) {
+                Write-Host "      -> [UI] Injecting CSS Grid Lines (${spacingPx}px)" -ForegroundColor Cyan
+                $css = "<style> body { background-color: white !important; background-size: ${spacingPx}px ${spacingPx}px !important; background-image: linear-gradient(to right, $lineColor 1px, transparent 1px), linear-gradient(to bottom, $lineColor 1px, transparent 1px) !important; } </style>"
+            } else {
+                Write-Host "      -> [UI] Injecting CSS Lined Paper (${spacingPx}px)" -ForegroundColor Cyan
+                $css = "<style> body { background-color: white !important; background-size: 100% ${spacingPx}px !important; background-image: linear-gradient(transparent $([math]::Max(1, $spacingPx - 1))px, $lineColor 1px) !important; } </style>"
+            }
+            
+            $htmlContent = Get-Content -Path $htmlFilePath -Raw
+            $htmlContent = $htmlContent -replace "(?i)</head>", "`n$css`n</head>"
+            Set-Content -Path $htmlFilePath -Value $htmlContent -Encoding UTF8
+        }
+    } catch {
+        Log-Error "Failed to inject CSS rule lines for page '$pageName'. Error: $_"
     }
-    return $folder
 }
 
-# --- Spider and find each page, create directory for each group, and build TOC HTML ---
+# --- Export page ---
+Function Export-OneNote-Page {
+    param( $onenote, $node, $path )
+    $name = ReplaceIllegal -text $node.name
+    $file = $(Join-Path -Path $path -ChildPath "$($name).htm")
+    Write-Host "    Page: $($file)"
+    
+    Wait-For-Page-Load -onenote $onenote -pageID $node.ID -pageName $name | Out-Null
+
+    try {
+        # 1. Export standard HTML
+        $onenote.Publish($node.ID, $file, 7, "")
+        
+        # 2. Get XML once for both Grid Lines and Attachments
+        $xml = ''
+        $onenote.GetPageContent($node.ID, [ref]$xml, 0)
+        
+        # 3. Inject CSS Rule/Grid lines
+        Inject-HTML-Background -xml $xml -htmlFilePath $file -pageName $name
+        
+    } catch {
+        Log-Error "COM API Publish() or XML retrieval failed for page '$name'. Error: $_"
+        return $null
+    }
+    
+    # 4. Export Attachments using already-fetched XML
+	$attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
+    Export-OneNote-Attachments -xml $xml -path $attachmentpath -pageName $name
+
+    return $file
+}
+
+# --- Copy embedded attachments (Updated to use passed XML) ---
+Function Export-OneNote-Attachments {
+    param ( $xml, $path, $pageName )
+    try {
+        $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
+        $xml | Select-Xml -XPath "//one:Page/one:Outline/one:OEChildren/one:OE/one:InsertedFile" -Namespace $schema | foreach {
+            $file = Join-Path -Path $path -ChildPath $_.Node.preferredName
+            Write-Host "      Attachment: $($file)"
+            try {
+                Copy-Item $_.Node.pathCache -Destination $file -ErrorAction Stop
+            } catch {
+                Log-Error "Failed to copy attachment '$($_.Node.preferredName)' for page '$pageName'. PathCache: '$($_.Node.pathCache)'. Error: $_"
+            }
+        }
+    } catch {
+        Log-Error "Failed to parse attachments XML for page '$pageName'. Error: $_"
+    }
+}
+
 Function Spider-OneNote-Notebook {
     param( $onenote, $node, $path, $notebookRoot )
     $tocHtml = ""
@@ -141,7 +222,6 @@ Function Spider-OneNote-Notebook {
                     $indentLevel = [int]$child.pageLevel * 20
                     $tocHtml += "<li class='page' style='margin-left: $($indentLevel)px;'><a href=`"$relUrl`">$displayName</a></li>`n"
                 }
-
             } else {
                 # --- It's a Section or Section Group ---
                 $folder = Join-Path -Path $path -ChildPath $safeName
@@ -163,54 +243,7 @@ Function Spider-OneNote-Notebook {
             Log-Error "Failed while spidering node '$errName'. Error: $_"
         }
     }
-    
     return $tocHtml
-}
-
-# --- Export page ---
-Function Export-OneNote-Page {
-    param( $onenote, $node, $path )
-    $name = ReplaceIllegal -text $node.name
-    $file = $(Join-Path -Path $path -ChildPath "$($name).htm")
-    Write-Host "    Page: $($file)"
-    
-    # Wait for the page to download its assets before exporting
-    Wait-For-Page-Load -onenote $onenote -pageID $node.ID -pageName $name | Out-Null
-
-    try {
-        # Export HTML
-        $onenote.Publish($node.ID, $file, 7, "")
-    } catch {
-        Log-Error "COM API Publish() failed for page '$name'. Error: $_"
-        return $null
-    }
-    
-    # Export Attachments
-	$attachmentpath = Join-Path -Path $path -ChildPath ($name + "_files")
-    Export-OneNote-Attachments -onenote $onenote -node $node -path $attachmentpath -pageName $name
-
-    return $file
-}
-
-# --- Copy embedded attachments ---
-Function Export-OneNote-Attachments {
-    param ( $onenote, $node, $path, $pageName )
-    try {
-        $xml = ''
-        $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
-        $onenote.GetPageContent($node.ID, [ref]$xml)
-        $xml | Select-Xml -XPath "//one:Page/one:Outline/one:OEChildren/one:OE/one:InsertedFile" -Namespace $schema | foreach {
-            $file = Join-Path -Path $path -ChildPath $_.Node.preferredName
-            Write-Host "      Attachment: $($file)"
-            try {
-                Copy-Item $_.Node.pathCache -Destination $file -ErrorAction Stop
-            } catch {
-                Log-Error "Failed to copy attachment '$($_.Node.preferredName)' for page '$pageName'. PathCache: '$($_.Node.pathCache)'. Error: $_"
-            }
-        }
-    } catch {
-        Log-Error "Failed to parse attachments XML for page '$pageName'. Error: $_"
-    }
 }
 
 Function ReplaceIllegal {
@@ -218,6 +251,15 @@ Function ReplaceIllegal {
     $illegal = [string]::join('',([System.IO.Path]::GetInvalidFileNameChars())) -replace '\\','\\'
     $replaced = $text -replace "[$illegal]",'_'
     return $replaced
+}
+
+Function Get-Folder($initialDirectory) {
+    [System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms")|Out-Null
+    $foldername = New-Object System.Windows.Forms.FolderBrowserDialog
+    $foldername.Description = "Select an export folder"
+    $foldername.rootfolder = "MyComputer"
+    if($foldername.ShowDialog() -eq "OK") { $folder += $foldername.SelectedPath }
+    return $folder
 }
 
 # ================= MAIN EXECUTION =================
@@ -291,7 +333,6 @@ foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
 </html>
 "@
 
-        # Save the index.htm at the root of the exported Notebook folder
         $indexPath = Join-Path -Path $nf -ChildPath "index.htm"
         Set-Content -Path $indexPath -Value $indexHtml -Encoding UTF8
         Write-Host "  -> Created Table of Contents: $($indexPath)"
