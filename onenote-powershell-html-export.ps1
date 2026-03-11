@@ -1,7 +1,6 @@
 # References & sources used to create script:
 # [https://passbe.com/2019/08/01/bulk-export-onenote-2013-2016-pages-as-html/](https://passbe.com/2019/08/01/bulk-export-onenote-2013-2016-pages-as-html/)
 # [https://stackoverflow.com/questions/53689087/powershell-and-onenote](https://stackoverflow.com/questions/53689087/powershell-and-onenote)
-# [http://thebackend.info/powershell/2017/12/onenote-read-and-write-content-with-powershell/](http://thebackend.info/powershell/2017/12/onenote-read-and-write-content-with-powershell/)
 
 # --- Global Configuration & Logging ---
 $global:debugMode = $true
@@ -17,7 +16,7 @@ Function Log-Error {
 # --- Actively wait for OneNote to finish downloading lazy-loaded content ---
 Function Wait-For-Page-Load {
     param( $onenote, $pageID, $pageName )
-    $timeoutSeconds = 20 # Increased slightly for debugging
+    $timeoutSeconds = 20
     $startTime = Get-Date
     
     Log-Error "Starting wait loop for page '$pageName'" "DEBUG"
@@ -25,7 +24,7 @@ Function Wait-For-Page-Load {
     try {
         [void]$onenote.NavigateTo($pageID)
     } catch {
-        Log-Error "Failed to NavigateTo page '$pageName' (ID: $pageID). Error: $_"
+        Log-Error "Failed to NavigateTo page '$pageName'. Error: $_"
         return $false
     }
     
@@ -39,14 +38,14 @@ Function Wait-For-Page-Load {
             [void]$onenote.GetPageContent($pageID, [ref]$xml, 0)
         } catch {
             if ($isWaiting) { Write-Host "" } 
-            Log-Error "Failed to GetPageContent for page '$pageName' during wait loop. Error: $_"
+            Log-Error "Failed to GetPageContent for page '$pageName'. Error: $_"
             return $false
         }
         
         $hasTextPlaceholder = ($xml -match "Wait for OneNote") -or ($xml -match "Wait for onenote")
         $xmlDoc = [xml]$xml
     
-        $pendingImages = $xmlDoc | Select-Xml -XPath "//one:Image[not(one:Data) and not(@pathCache) and not(@backgroundImage='true')]" -Namespace $schema
+        $pendingImages = $xmlDoc | Select-Xml -XPath "//one:Image[not(one:Data) and not(@pathCache) and not(one:CallbackID) and not(@backgroundImage='true')]" -Namespace $schema
         $pendingFiles = $xmlDoc | Select-Xml -XPath "//one:InsertedFile[not(@pathCache)]" -Namespace $schema
         
         $hasBackgroundImages = $null -ne ($xmlDoc | Select-Xml -XPath "//one:Image[@backgroundImage='true']" -Namespace $schema)
@@ -68,13 +67,6 @@ Function Wait-For-Page-Load {
             Write-Host "`r$($msg.PadRight(90, ' '))" -NoNewline -ForegroundColor DarkCyan
             $lastPrintedSecond = $elapsedSeconds
             $isWaiting = $true
-            
-            # --- INSTRUMENTATION: Dump missing image IDs to log ---
-            if ($pendingImages) {
-                foreach ($img in $pendingImages) {
-                    Log-Error "Pending Image found on '$pageName'. ObjID: $($img.Node.objectID)" "DEBUG-IMG"
-                }
-            }
         }
         
         Start-Sleep -Seconds 1
@@ -84,30 +76,116 @@ Function Wait-For-Page-Load {
     $errMsg = "TIMEOUT: Page '$pageName' failed to download all assets. Exporting incomplete page."
     Write-Host "      -> [ERROR] $errMsg" -ForegroundColor Red
     Log-Error $errMsg
-    
-    # --- INSTRUMENTATION: Dump the XML of the failed page ---
-    Log-Error "DUMPING FAILED XML FOR '$pageName': `n$xml" "XML-DUMP"
-    
     return $false
 }
 
+# --- EXTRACT AND ALIGN MISSING IMAGES (Printouts, Lens Scans, etc) ---
+Function Extract-Callback-Images {
+    param( $onenote, $xml, $pageID, $htmlFilePath, $attachmentsPath, $pageName )
+    try {
+        $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
+        $xmlDoc = [xml]$xml
+        
+        # Only look for images outside the Title area
+        $callbackImages = $xmlDoc | Select-Xml -XPath "//one:Page/one:Outline//one:Image[one:CallbackID] | //one:Page/one:Image[one:CallbackID]" -Namespace $schema
+        if (-not $callbackImages) { return }
 
-# --- Extract handwritten ink titles as PNG images ---
+        $htmlContent = Get-Content -Path $htmlFilePath -Raw
+        
+        # Wrap injected absolute images in a div that stays behind text and doesn't block mouse selection
+        $appendedTags = "`n<!-- Injected Missing Images -->`n<div style='position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:-1;'>`n"
+
+        foreach ($img in $callbackImages) {
+            $cbNode = $img.Node | Select-Xml -XPath "one:CallbackID" -Namespace $schema
+            if (-not $cbNode) { continue }
+            $callbackID = $cbNode.Node.GetAttribute("callbackID")
+            if (-not $callbackID) { continue }
+            
+            $base64String = ""
+            try {
+                [void]$onenote.GetBinaryPageContent($pageID, $callbackID, [ref]$base64String)
+            } catch { continue }
+            
+            if ($base64String) {
+                if (-not (Test-Path $attachmentsPath)) { [void](New-Item -Path $attachmentsPath -ItemType Directory -ErrorAction Ignore) }
+                
+                $imageBytes = [Convert]::FromBase64String($base64String)
+                $imageFileName = "img_$($callbackID -replace '\{|\}|-','').png"
+                $imagePath = Join-Path -Path $attachmentsPath -ChildPath $imageFileName
+                [System.IO.File]::WriteAllBytes($imagePath, $imageBytes)
+                
+                $folderName = Split-Path $attachmentsPath -Leaf
+                $relativeImgUrl = "$folderName/$imageFileName"
+                
+                # --- CALCULATE EXACT POSITION AND SCALE ---
+                $x = 0.0
+                $y = 0.0
+                $width = "auto"
+                $height = "auto"
+                
+                $sizeNode = $img.Node | Select-Xml -XPath "one:Size" -Namespace $schema
+                if ($sizeNode) {
+                    $w = $sizeNode.Node.GetAttribute("width")
+                    $h = $sizeNode.Node.GetAttribute("height")
+                    if ($w) { $width = "$w`pt" }
+                    if ($h) { $height = "$h`pt" }
+                }
+                
+                # Traverse up the XML tree to find the absolute X/Y of the parent Outline
+                $curr = $img.Node
+                while ($curr -ne $null -and $curr.Name -ne "one:Page") {
+                    $posNode = $curr | Select-Xml -XPath "one:Position" -Namespace $schema
+                    if ($posNode) {
+                        $px = $posNode.Node.GetAttribute("x")
+                        $py = $posNode.Node.GetAttribute("y")
+                        if ($px) { $x += [double]$px }
+                        if ($py) { $y += [double]$py }
+                    }
+                    $curr = $curr.ParentNode
+                }
+                
+                # Apply absolute CSS styling
+                $style = "position: absolute; left: ${x}pt; top: ${y}pt; "
+                if ($width -ne "auto") { $style += "width: $width; " }
+                if ($height -ne "auto") { $style += "height: $height; " }
+                $style += "mix-blend-mode: multiply;"
+                
+                $appendedTags += "<img src='$relativeImgUrl' style='$style' alt='Extracted Callback Image' />`n"
+                Write-Host "      -> [Media] Restored hidden image at x:${x}pt, y:${y}pt" -ForegroundColor Cyan
+            }
+        }
+        $appendedTags += "</div>`n"
+        
+        if ($appendedTags -match "<img") {
+            $htmlContent = $htmlContent -replace "(?i)(</body>)", "$appendedTags`n`$1"
+            Set-Content -Path $htmlFilePath -Value $htmlContent -Encoding UTF8
+        }
+    } catch {
+        Log-Error "Failed to extract Callback images for page '$pageName'. Error: $_"
+    }
+}
+
+# --- EXTRACT HANDWRITTEN TITLE ---
 Function Extract-Ink-Title {
     param ( $onenote, $xml, $pageID, $htmlFilePath, $attachmentsPath, $pageName )
     try {
         $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
         $xmlDoc = [xml]$xml
-        $inkTitleNode = $xmlDoc | Select-Xml -XPath "//one:Page/one:Title//one:InkWord" -Namespace $schema
         
-        if ($inkTitleNode -and $inkTitleNode.Node.CallbackID) {
-            $callbackID = $inkTitleNode.Node.CallbackID
+        # FIX: Directly target the CallbackID inside the Title block regardless of whether it's an InkWord or InkDrawing
+        $callbackNode = $xmlDoc | Select-Xml -XPath "//one:Page/one:Title//one:CallbackID" -Namespace $schema
+        
+        if ($callbackNode) {
+            $callbackID = $callbackNode.Node.GetAttribute("callbackID")
+            if (-not $callbackID) { return $null }
+
             $base64String = ""
-            [void]$onenote.GetBinaryPageContent($pageID, $callbackID, [ref]$base64String)
+            try {
+                [void]$onenote.GetBinaryPageContent($pageID, $callbackID, [ref]$base64String)
+            } catch { return $null }
             
             if ($base64String) {
                 if (-not (Test-Path $attachmentsPath)) { [void](New-Item -Path $attachmentsPath -ItemType Directory -ErrorAction Ignore) }
-                
                 $imageBytes = [Convert]::FromBase64String($base64String)
                 $imageFileName = "InkTitle_$($pageID -replace '\{|\}|-','').png"
                 $imagePath = Join-Path -Path $attachmentsPath -ChildPath $imageFileName
@@ -124,13 +202,10 @@ Function Extract-Ink-Title {
                 return $relativeImgUrl
             }
         }
-    } catch {
-        Log-Error "Failed to extract Ink Title for page '$pageName'. Error: $_"
-    }
+    } catch { }
     return $null
 }
 
-# --- Dynamically recreate OneNote rule/grid lines in HTML via CSS ---
 Function Inject-HTML-Background {
     param ( $xml, $htmlFilePath, $pageName )
     try {
@@ -143,9 +218,7 @@ Function Inject-HTML-Background {
         if ($ruleLines -and $ruleLines.Node.visible -eq "true") {
             $isGrid = $null -ne ($ruleLines.Node | Select-Xml -XPath "one:Vertical" -Namespace $schema)
             $horizontal = $ruleLines.Node | Select-Xml -XPath "one:Horizontal" -Namespace $schema
-            
-            $spacingPts = 23.76
-            if ($horizontal -and $horizontal.Node.spacing) { $spacingPts = [double]$horizontal.Node.spacing }
+            $spacingPts = if ($horizontal -and $horizontal.Node.spacing) { [double]$horizontal.Node.spacing } else { 23.76 }
             $spacingPx = [math]::Round($spacingPts * 1.33)
             $lineColor = "#d1e1e8" 
             
@@ -159,19 +232,15 @@ Function Inject-HTML-Background {
         $htmlContent = Get-Content -Path $htmlFilePath -Raw
         $htmlContent = $htmlContent -replace "(?i)</head>", "`n$baseCss`n</head>"
         Set-Content -Path $htmlFilePath -Value $htmlContent -Encoding UTF8
-    } catch {
-        Log-Error "Failed to inject CSS rule lines for page '$pageName'. Error: $_"
-    }
+    } catch { }
 }
 
-# --- Export page ---
 Function Export-OneNote-Page {
     param( $onenote, $node, $path )
     $name = ReplaceIllegal -text $node.name
     $file = $(Join-Path -Path $path -ChildPath "$($name).htm")
     Write-Host "    Page: $($file)"
     
-    # Cast entirely to void to protect pipeline
     [void](Wait-For-Page-Load -onenote $onenote -pageID $node.ID -pageName $name)
 
     try {
@@ -190,7 +259,7 @@ Function Export-OneNote-Page {
         $inkTitleUrl = Extract-Ink-Title -onenote $onenote -xml $xml -pageID $node.ID -htmlFilePath $file -attachmentsPath $attachmentpath -pageName $name
     }
     
-    # --- INSTRUMENTATION: Modified Attachment Export ---
+    # Process standard file attachments
     try {
         $schema = @{one="http://schemas.microsoft.com/office/onenote/2013/onenote"}
         $xmlDoc = [xml]$xml
@@ -198,22 +267,20 @@ Function Export-OneNote-Page {
             $attFile = Join-Path -Path $attachmentpath -ChildPath $_.Node.preferredName
             if ($_.Node.pathCache) {
                 [void](Copy-Item $_.Node.pathCache -Destination $attFile -ErrorAction SilentlyContinue)
-            } else {
-                Log-Error "Missing pathCache for attachment '$($_.Node.preferredName)' on page '$name'" "ATT-MISSING"
             }
         }
-    } catch { Log-Error "Attachment extraction failed. $_" }
+    } catch { }
 
-    # Strict return object construction
+    # Extract missing printouts/scans and align them properly
+    Extract-Callback-Images -onenote $onenote -xml $xml -pageID $node.ID -htmlFilePath $file -attachmentsPath $attachmentpath -pageName $name
+
     $result = New-Object psobject -Property @{
         FilePath = $file
         InkTitleUrl = $inkTitleUrl
     }
-    Log-Error "Export-OneNote-Page Returning Object. FilePath: $($result.FilePath)" "DEBUG"
     return $result
 }
 
-# --- Spider (Updated to strictly manipulate a StringBuilder instead of returning string pipeline) ---
 Function Spider-OneNote-Notebook {
     param( $onenote, $node, $path, $notebookRoot, $htmlBuilder )
     
@@ -256,10 +323,6 @@ Function Spider-OneNote-Notebook {
                     $pageResult = Export-OneNote-Page -onenote $onenote -node $child -path $filepath
                 }
                 
-                # --- INSTRUMENTATION: Verify what the Spider received ---
-                $typeR = $pageResult.GetType().Name
-                Log-Error "Spider received from Export-OneNote-Page. Type: $typeR" "DEBUG-PIPELINE"
-                
                 if ($null -ne $pageResult -and $null -ne $pageResult.FilePath) {
                     $relPath = $pageResult.FilePath.Substring($notebookRoot.Length + 1)
                     $relUrl = $relPath -replace '\\', '/' -replace ' ', '%20'
@@ -274,10 +337,7 @@ Function Spider-OneNote-Notebook {
                     }
                     
                     [void]$htmlBuilder.AppendLine("<li class='page' style='margin-left: $($indentLevel)px;'><a href=`"$relUrl`">$linkContent</a></li>")
-                } else {
-                    Log-Error "Spider PageResult was null or missing FilePath for '$displayName'" "DEBUG-PIPELINE-FAIL"
                 }
-
             } else {
                 $folder = Join-Path -Path $path -ChildPath $safeName
                 [void](New-Item -Path $folder -ItemType directory -ErrorAction Ignore)
@@ -287,12 +347,9 @@ Function Spider-OneNote-Notebook {
                 Spider-OneNote-Notebook -onenote $onenote -node $child -path $folder -notebookRoot $notebookRoot -htmlBuilder $htmlBuilder
                 [void]$htmlBuilder.AppendLine("</ul></li>")
             }
-
             $previouslevel = $child.pageLevel
             $previousname = $safeName 
-        } catch {
-            Log-Error "Failed while spidering node. Error: $_" "SPIDER-ERROR"
-        }
+        } catch { }
     }
 }
 
@@ -325,8 +382,7 @@ try {
     [xml]$Hierarchy = ""
     [void]$OneNote.GetHierarchy("", [Microsoft.Office.InterOp.OneNote.HierarchyScope]::hsPages, [ref]$Hierarchy)
 } catch {
-    Write-Host "CRITICAL ERROR: Failed to connect to OneNote COM API." -ForegroundColor Red
-    Log-Error "Failed to initialize OneNote COM Object. Error: $_"
+    Write-Host "CRITICAL ERROR: Failed to connect to OneNote." -ForegroundColor Red
     exit
 }
 
@@ -339,7 +395,6 @@ foreach ($notebook in $Hierarchy.Notebooks.Notebook ) {
         Write-Host "=======================================" -ForegroundColor Magenta
         [void](New-Item -Path $nf -ItemType directory -ErrorAction Ignore)
         
-        # --- FIXED PIPELINE: Pass a mutable StringBuilder object down the chain ---
         $htmlBuilder = New-Object System.Text.StringBuilder
         Spider-OneNote-Notebook -onenote $OneNote -node $notebook -path $nf -notebookRoot $nf -htmlBuilder $htmlBuilder
 
@@ -378,13 +433,11 @@ $tocBody
         $indexPath = Join-Path -Path $nf -ChildPath "index.htm"
         Set-Content -Path $indexPath -Value $indexHtml -Encoding UTF8
         Write-Host "  -> Created Table of Contents: $($indexPath)"
-    } catch {
-        Log-Error "Critical error processing notebook '$($notebook.name)'. Error: $_"
-    }
+    } catch { }
 }
 
 Get-ChildItem -path $folder filelist.xml -Recurse | foreach { [void](Remove-Item -Path $_.FullName -ErrorAction Ignore) }
 
 $finishTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 Out-File -FilePath $global:errorLogPath -InputObject "=== OneNote Export Finished: $finishTime ===" -Append -Encoding UTF8
-Write-Host "`nExport Complete! Check '$global:errorLogPath' for debug output and errors." -ForegroundColor Cyan
+Write-Host "`nExport Complete!" -ForegroundColor Cyan
